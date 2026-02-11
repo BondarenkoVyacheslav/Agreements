@@ -18,4 +18,4 @@ def extract_text_from_image(file_name: str) -> OcrClientResponse:
     return OcrClientResponse(text=payload.get("text"), success=bool(payload.get("success")))
 
 
-# print(extract_text_from_image("test_files/test2.jpg").text)
+print(extract_text_from_image("test_files/test3_p.jpg").text)
