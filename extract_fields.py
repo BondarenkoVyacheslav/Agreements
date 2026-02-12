@@ -72,7 +72,6 @@ def extract_fields(compiled_extractor: dspy.Module, file_name: str) -> Extracted
     """
         Будем тут вызывать ocr_client.py, доставать текст.
         Доставать необходимые поля, дообучать программу извлечения,
-
     """
     ocr_client_response: OcrClientResponse = extract_text_from_image(file_name=file_name)
 
