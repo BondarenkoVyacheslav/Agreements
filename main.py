@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import json
+import logging
 
 import dspy
 
@@ -9,6 +10,17 @@ from extract_fields import build_trainset, compile_extractor, extract_fields, Ex
 
 DIRECTORY = Path("test_images")
 TRAIN_JSONL: Path | None = None  # например: Path("train_data.jsonl")
+LOGGER = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def load_rows(train_path: Path) -> list[dict]:
@@ -38,6 +50,7 @@ def main() -> int:
     :return: int
     :rtype: int
     """
+    configure_logging()
 
     # Заполняем выгрузку данными которые нам передали
     transfer_excel_data()
@@ -56,20 +69,27 @@ def main() -> int:
     images = [*DIRECTORY.glob("*.jpg")]
     if not images:
         raise FileNotFoundError(f"No images found in: {DIRECTORY}")
+    LOGGER.info("Найдено %d изображений. Начинаем обработку.", len(images))
 
     for image in images:
-        print(f"----{image}----")
+        LOGGER.info("Обрабатываем изображение: %s", image)
 
         stem = image.stem  # "2025-06-05 12345"
         educational_loan_agreement_date, educational_loan_agreement_number = stem.replace("_", " ").split(maxsplit=1)
 
         result: ExtractedFields = extract_fields(compiled_extractor, image)
+        LOGGER.info(
+            "Поля извлечены для договора %s от %s",
+            educational_loan_agreement_number,
+            educational_loan_agreement_date,
+        )
+        LOGGER.debug("Извлечённые данные: %s", result)
 
         # Заполняем поле 9 согласно дате заключения договора
         reporting_dates: str | None = None
-        month: str | None = None 
-        if result.paid_edu_contract_date != "ОШИБКА": 
-            month = result.paid_edu_contract_date.split("-")[1] 
+        month: str | None = None
+        if result.paid_edu_contract_date != "ОШИБКА":
+            month = result.paid_edu_contract_date.split("-")[1]
 
         if month == "07":
             reporting_dates = "ИЮЛЬ;АВГУСТ;СЕНТЯБРЬ"
@@ -78,17 +98,31 @@ def main() -> int:
         elif month == "09":
             reporting_dates = "СЕНТЯБРЬ"
         else:
-            print("Проблема с месяцем заключения договора!")
-        
+            LOGGER.warning(
+                "Проблема с месяцем заключения договора: paid_edu_contract_date=%s",
+                result.paid_edu_contract_date,
+            )
+
         if not transfer_reporting_data_to_excel(educational_loan_agreement_number, educational_loan_agreement_date, reporting_dates):
-            print(f"Договор с номером образовательного кредита:{educational_loan_agreement_number} и датой заключения кредита: {educational_loan_agreement_date} не был найден!")
-
-
+            LOGGER.error(
+                "Договор с номером образовательного кредита %s и датой %s не найден при заполнении reporting-данных.",
+                educational_loan_agreement_number,
+                educational_loan_agreement_date,
+            )
+        LOGGER.info("Определены reporting_dates: %s", reporting_dates)
 
         # Далее заполнямем извлеченные поля в соответствующие колоники
         if not transfer_extracted_data_and_logic_to_excel(educational_loan_agreement_number, educational_loan_agreement_date, result):
-            print(f"Проблемы с заполнением полей от LLM или логики вывода, для договора с номером образовательного кредита:{educational_loan_agreement_number} и датой заключения кредита: {educational_loan_agreement_date}")
-
+            LOGGER.error(
+                "Проблемы с заполнением полей от LLM/логики вывода для договора %s от %s.",
+                educational_loan_agreement_number,
+                educational_loan_agreement_date,
+            )
+        LOGGER.info(
+            "Заполнены извлечённые поля и сформирован вывод ИИ для договора %s от %s.",
+            educational_loan_agreement_number,
+            educational_loan_agreement_date,
+        )
 
     return 0
 

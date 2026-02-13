@@ -2,7 +2,7 @@ from pydantic import BaseModel, Field
 import dspy
 from dspy.teleprompt import BootstrapFewShot
 from typing import Optional, List
-from ocr_client import extract_text_from_image, OcrClientResponse
+from ocr_client import extract_text_from_image_with_qwen3_vl, extract_text_from_image, OcrClientResponse
 from utils import metric
 
 
@@ -73,7 +73,7 @@ def extract_fields(compiled_extractor: dspy.Module, file_name: str) -> Extracted
         Будем тут вызывать ocr_client.py, доставать текст.
         Доставать необходимые поля, дообучать программу извлечения,
     """
-    ocr_client_response: OcrClientResponse = extract_text_from_image(file_name=file_name)
+    ocr_client_response: OcrClientResponse = extract_text_from_image_with_qwen3_vl(file_name=file_name)
 
     if not ocr_client_response.success or not ocr_client_response.text:
         print("Ошибка извлечения текста!")
@@ -115,13 +115,15 @@ if __name__ == "__main__":
 
     # 2) CLI аргументы
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", required=True, help="Путь к изображению/PDF для OCR")
     parser.add_argument(
         "--train",
         default=None,
         help="JSONL с размеченными примерами для компиляции (опционально)",
     )
     args = parser.parse_args()
+
+    # Жестко заданный путь к входному файлу
+    file_name = "test_images/01.02.2025 130291.jpg"
 
     # 3) Готовим extractor (скомпилированный или базовый)
     if args.train:
@@ -136,5 +138,5 @@ if __name__ == "__main__":
         compiled_extractor = Extractor()  # без компиляции (временно)
 
     # 4) Инференс
-    result = extract_fields(compiled_extractor, args.file)
+    result = extract_fields(compiled_extractor, file_name)
     print(result.model_dump_json(ensure_ascii=False, indent=2))
