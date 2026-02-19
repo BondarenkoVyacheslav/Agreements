@@ -152,6 +152,41 @@ def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_a
             return value.strftime("%Y-%m-%d")
         text = str(value).strip()
         return text if text else "ОШИБКА"
+    
+    def _check_university_match(cell_name: str, ex_name: str) -> tuple[bool, str]:
+        """
+        Проверка совпадения названий ВУЗов.
+        Сначала простая проверка, если сомнения — LLM.
+        :return: (совпадает: bool, комментарий: str)
+        """
+        if not cell_name or not ex_name:
+            return False, "Пустое название"
+        
+        if cell_name.upper() == "ОШИБКА" or ex_name.upper() == "ОШИБКА":
+            return False, "ОШИБКА в названии"
+        
+        cell_norm = _norm_text(cell_name)
+        ex_norm = _norm_text(ex_name)
+        
+        # Уровень 1: Точное совпадение
+        if cell_norm == ex_norm:
+            return True, "Точное совпадение"
+        
+        # Уровень 2: Одно название в другом
+        if cell_norm in ex_norm or ex_norm in cell_norm:
+            return True, "Одно в другом"
+        
+        # Уровень 3: Сомнения — спрашиваем LLM
+        try:
+            from extract_fields import check_university_name_llm
+            llm_result = check_university_name_llm(cell_name, ex_name)
+            if llm_result:
+                return True, "Совпадение по LLM"
+            else:
+                return False, "Разные ВУЗы (LLM)"
+        except Exception as e:
+            LOGGER.warning(f"Ошибка LLM при сравнении ВУЗов: {e}")
+            return False, "Ошибка LLM"
 
     target_date = _norm(edu_loan_agr_date)
     target_num = _norm(edu_loan_agr_num)
@@ -206,11 +241,13 @@ def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_a
 
             messages: list[str] = []
 
+            # Проверка ВУЗа (с LLM при сомнениях)
             cell_university_norm = _norm_text(str(cell_university_name) if cell_university_name is not None else "")
             ex_university_norm = _norm_text(ex_university)
             if cell_university_norm not in ("", "ОШИБКА") and ex_university_norm not in ("", "ОШИБКА"):
-                if cell_university_norm != ex_university_norm:
-                    messages.append("Иной вуз")
+                is_match, comment = _check_university_match(cell_university_name, ex_university)
+                if not is_match:
+                    messages.append(f"Иной вуз ({comment})")
 
             cell_fio_norm = _norm_text(str(cell_fio) if cell_fio is not None else "")
             ex_fio_norm = _norm_text(ex_student_fio)

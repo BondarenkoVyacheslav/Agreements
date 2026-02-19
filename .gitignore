@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+
+# Local secrets
+.env
+.env.*
+
+
+/agreements
+/extracted_texts
+/test_images
+
