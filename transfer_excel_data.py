@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from contextlib import closing
 from pathlib import Path
+import re
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font
+import dspy
 
 from extract_fields import ExtractedFields
 from utils import _norm as _norm_text, _norm_code
+from ocr_client import check_university_name_llm
+
+import logging
+LOGGER = logging.getLogger(__name__)
 
 SOURCE_PATH = Path("СВОД СБЕР июль-сентябрь.xlsx")
 TEMPLATE_PATH = Path("Шаблон_выгрузки.xlsx")
@@ -129,7 +135,7 @@ def transfer_reporting_data_to_excel(edu_loan_agr_num: str, edu_loan_agr_date: s
     return found
 
 
-def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_agr_date: str, exctracted_fields: ExtractedFields) -> bool:
+def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_agr_date: str, exctracted_fields: ExtractedFields, lm: dspy.LM | None = None) -> bool:
     """Заполняем графы 23-28 данными которые мы достали с помощью LLM и вывод в 29 граф"""
     if not OUTPUT_PATH.exists():
         if transfer_excel_data() != 0:
@@ -167,6 +173,20 @@ def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_a
         
         cell_norm = _norm_text(cell_name)
         ex_norm = _norm_text(ex_name)
+
+        def _normalize_university_for_compare(value: str) -> str:
+            normalized = _norm_text(value)
+            # Убираем кавычки и пунктуацию, чтобы OCR/форматирование
+            # не ломали сравнение одинаковых названий.
+            normalized = re.sub(r"[^0-9A-ZА-Я]+", " ", normalized)
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            return normalized
+
+        def _quoted_core(value: str) -> str:
+            match = re.search(r"[«\"]([^»\"]+)[»\"]", str(value))
+            if not match:
+                return ""
+            return _norm_text(match.group(1))
         
         # Уровень 1: Точное совпадение
         if cell_norm == ex_norm:
@@ -175,11 +195,25 @@ def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_a
         # Уровень 2: Одно название в другом
         if cell_norm in ex_norm or ex_norm in cell_norm:
             return True, "Одно в другом"
+
+        # Уровень 2.2: Вхождение после мягкой нормализации (без кавычек/пунктуации)
+        cell_soft_norm = _normalize_university_for_compare(cell_name)
+        ex_soft_norm = _normalize_university_for_compare(ex_name)
+        if cell_soft_norm == ex_soft_norm:
+            return True, "Совпадение после нормализации"
+        if cell_soft_norm in ex_soft_norm or ex_soft_norm in cell_soft_norm:
+            return True, "Одно в другом после нормализации"
+
+        # Уровень 2.5: Совпадение ключевого имени в кавычках
+        cell_quoted_core = _quoted_core(cell_name)
+        ex_quoted_core = _quoted_core(ex_name)
+        if cell_quoted_core and ex_quoted_core and cell_quoted_core == ex_quoted_core:
+            return True, "Совпадение по названию в кавычках"
         
         # Уровень 3: Сомнения — спрашиваем LLM
         try:
-            from extract_fields import check_university_name_llm
-            llm_result = check_university_name_llm(cell_name, ex_name)
+            llm_result = check_university_name_llm(cell_name, ex_name, lm)
+            LOGGER.info(f"Уточняем у LLM сходсвто название вузов.")
             if llm_result:
                 return True, "Совпадение по LLM"
             else:
@@ -247,27 +281,59 @@ def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_a
             if cell_university_norm not in ("", "ОШИБКА") and ex_university_norm not in ("", "ОШИБКА"):
                 is_match, comment = _check_university_match(cell_university_name, ex_university)
                 if not is_match:
-                    messages.append(f"Иной вуз ({comment})")
+                    messages.append(f"Иной вуз")
 
+            # Проверка ФИО
             cell_fio_norm = _norm_text(str(cell_fio) if cell_fio is not None else "")
             ex_fio_norm = _norm_text(ex_student_fio)
-            if cell_fio_norm not in ("", "ОШИБКА") and ex_fio_norm not in ("", "ОШИБКА"):
-                if cell_fio_norm != ex_fio_norm:
-                    messages.append("Не найден")
 
-                    cell_parts = cell_fio_norm.split()
-                    ex_parts = ex_fio_norm.split()
-                    if len(cell_parts) >= 2 and len(ex_parts) >= 2:
-                        name_messages: list[str] = []
-                        if cell_parts[0] != ex_parts[0]:
-                            name_messages.append("Иная фамилия")
-                        if cell_parts[1] != ex_parts[1]:
-                            name_messages.append("Иное имя")
-                        if name_messages:
-                            if len(name_messages) == 2:
-                                messages.append(" / ".join(name_messages))
-                            else:
-                                messages.append(name_messages[0])
+            if cell_fio_norm not in ("", "ОШИБКА") and ex_fio_norm not in ("", "ОШИБКА"):
+                cell_parts = cell_fio_norm.split()
+                ex_parts = ex_fio_norm.split()
+                
+                # Определяем части ФИО (фамилия, имя, отчество)
+                cell_surname = cell_parts[0] if len(cell_parts) >= 1 else ""
+                cell_name = cell_parts[1] if len(cell_parts) >= 2 else ""
+                cell_patronymic = cell_parts[2] if len(cell_parts) >= 3 else ""
+                
+                ex_surname = ex_parts[0] if len(ex_parts) >= 1 else ""
+                ex_name = ex_parts[1] if len(ex_parts) >= 2 else ""
+                ex_patronymic = ex_parts[2] if len(ex_parts) >= 3 else ""
+                
+                # Проверяем совпадения по частям
+                surname_match = cell_surname == ex_surname
+                name_match = cell_name == ex_name
+                patronymic_match = cell_patronymic == ex_patronymic
+                
+                # Считаем количество совпадений
+                matches_count = sum([surname_match, name_match, patronymic_match])
+                
+                # Формируем сообщения о несовпадениях
+                fio_differences: list[str] = []
+                if not surname_match:
+                    fio_differences.append("Иная фамилия")
+                if not name_match:
+                    fio_differences.append("Иное имя")
+                if not patronymic_match and cell_patronymic and ex_patronymic:
+                    # fio_differences.append("Иное отчество")
+                    pass
+                
+                # Логика вывода (по требованиям)
+                if matches_count >= 2:
+                    # Совпали минимум 2 части (фамилия+имя ИЛИ фамилия+отчество)
+                    # → Не выводим "Не найден", только указываем различия
+                    if fio_differences:
+                        messages.append("; ".join(fio_differences))
+                elif matches_count == 1:
+                    # Совпала только 1 часть (например, только фамилия)
+                    # → Выводим "Не найден" + уточнение
+                    messages.append("Не найден")
+                    if fio_differences:
+                        messages.append("; ".join(fio_differences))
+                else:
+                    # Не совпало ничего
+                    # → Выводим "Не найден"
+                    messages.append("Не найден")
 
             cell_cnp_norm = _norm_code(str(cell_cnp) if cell_cnp is not None else "")
             ex_specialty_norm = _norm_code(ex_specialty)

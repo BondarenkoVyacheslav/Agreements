@@ -1,13 +1,15 @@
 import base64
 import logging
 import os
-from time import perf_counter
+import re
+from time import perf_counter, sleep
 from dataclasses import dataclass
 
 import requests
 from openai import OpenAI
 import dspy
 
+LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://ocr.g-309.ru"
 OPENAI_BASE_URL = "http://10.14.49.32:31751/v1"
@@ -68,19 +70,72 @@ def extract_text_from_image_with_qwen3_vl(file_name: str) -> OcrClientResponse:
         return OcrClientResponse(text=None, success=False)
     
 
-import dspy
-import os
-from typing import Optional
+def _parse_bool_answer(raw_response: object) -> bool | None:
+    if isinstance(raw_response, list):
+        if not raw_response:
+            return None
+        raw_response = raw_response[0]
+
+    if isinstance(raw_response, dict):
+        raw_text = str(
+            raw_response.get("text")
+            or raw_response.get("content")
+            or raw_response
+        )
+    else:
+        raw_text = str(raw_response)
+
+    answer_upper = raw_text.strip().upper()
+    compact_answer = re.sub(r"[^A-ZА-Я]+", " ", answer_upper).strip()
+    tokens = compact_answer.split()
+
+    for token in tokens:
+        if token in {"TRUE", "ДА", "YES"}:
+            return True
+        if token in {"FALSE", "НЕТ", "NO"}:
+            return False
+
+    if "TRUE" in answer_upper:
+        return True
+    if "FALSE" in answer_upper:
+        return False
+    return None
 
 
-def check_university_name_llm(cell_university_name: str, university_name: str) -> bool:
-    """
-    Отправляет запрос LLM для сравнения названий университетов.
-    
-    :param cell_university_name: Название университета из Excel-ячейки (эталон)
-    :param university_name: Название университета, извлечённое LLM из документа
-    :return: True если названия относятся к одному ВУЗу, иначе False
-    """
+def _is_empty_or_truncated_response(raw_response: object) -> bool:
+    if not isinstance(raw_response, list) or not raw_response:
+        return False
+
+    first_item = raw_response[0]
+    if isinstance(first_item, dict):
+        text_value = str(first_item.get("text") or first_item.get("content") or "").strip()
+        finish_reason = str(
+            first_item.get("finish_reason")
+            or first_item.get("finishReason")
+            or ""
+        ).strip().lower()
+        reasoning_content = str(first_item.get("reasoning_content") or "").strip()
+
+        if finish_reason in {"length", "max_tokens"}:
+            return True
+        if not text_value and reasoning_content:
+            return True
+        if not text_value:
+            return True
+    return False
+
+
+def _normalize_openrouter_model(model_name: str) -> str:
+    value = str(model_name).strip()
+    if not value:
+        return value
+    if value.startswith("openrouter/"):
+        return value
+    return f"openrouter/{value}"
+
+
+def check_university_name_llm(cell_university_name: str, university_name: str, lm: dspy.LM | None = None) -> bool:
+    """Отправляет запрос LLM для сравнения названий университетов."""
     
     # Быстрая проверка на пустые значения
     if not cell_university_name or not university_name:
@@ -91,11 +146,19 @@ def check_university_name_llm(cell_university_name: str, university_name: str) -
         return False
     
     # Инициализация LLM
-    lm = dspy.LM(
-        "openrouter/qwen/qwen3-30b-a3b", 
-        api_key=os.environ["OPEN_ROUTER_API_KEY"]
-    )
-    dspy.configure(lm=lm)
+    model_chain = [
+        _normalize_openrouter_model(os.getenv("UNIVERSITY_CHECK_LLM_MODEL_1", "openrouter/qwen/qwen3-30b-a3b")),
+        _normalize_openrouter_model(os.getenv("UNIVERSITY_CHECK_LLM_MODEL_2", "openai/gpt-oss-120b")),
+        _normalize_openrouter_model(os.getenv("UNIVERSITY_CHECK_LLM_MODEL_3", "google/gemini-3-flash-preview")),
+    ]
+    model_chain = [model for model in model_chain if model]
+
+    if lm is None:
+        lm = dspy.LM(
+            model_chain[0],
+            api_key=os.environ["OPEN_ROUTER_API_KEY"]
+        )
+    
     
     # Формируем промпт прямо здесь
     prompt = f"""
@@ -106,8 +169,17 @@ def check_university_name_llm(cell_university_name: str, university_name: str) -
         Правила:
         1) Игнорируй различия в регистре, пробелах, пунктуации.
         2) Сокращения и полные названия одного ВУЗа считай совпадением (например: "МГУ" и "Московский государственный университет").
-        3) Если названия явно разные — верни False.
-        4) Верни ТОЛЬКО True или False, без объяснений.
+        3) Если в названиях совпадает ключевое имя (например в кавычках),
+           считай что это один ВУЗ, даже если различаются служебные слова
+           вроде "федеральный/национальный/государственный/исследовательский".
+        4) Учитывай возможные OCR-опечатки и ошибки извлечения текста:
+           - замена/пропуск/добавление 1-2 букв;
+           - близкие варианты написания имён и слов.
+           Если почти всё название совпадает, а различие только в вероятной опечатке,
+           считай что это один ВУЗ.
+           Пример: "Патрика Лумумбы" и "Патриса Лумумбы" — это один и тот же ВУЗ.
+        5) Если названия явно разные по ключевой части — верни False.
+        6) Верни ТОЛЬКО True или False, без объяснений.
 
         Название из Excel: {cell_university_name}
         Название из документа: {university_name}
@@ -115,23 +187,61 @@ def check_university_name_llm(cell_university_name: str, university_name: str) -
         Ответ (True/False):
         """.strip()
     
+    max_attempts = max(1, int(os.getenv("UNIVERSITY_CHECK_LLM_RETRIES", "3")))
+    retry_delay_sec = max(0.0, float(os.getenv("UNIVERSITY_CHECK_LLM_RETRY_DELAY_SEC", "0.8")))
+    fallback_lms_by_model: dict[str, dspy.LM] = {}
+
     try:
-        # Отправляем запрос к LLM
-        response = lm(prompt, max_tokens=10)
-        answer = str(response[0]).strip().upper()
-        
-        # Парсим ответ
-        if answer == "TRUE":
-            return True
-        elif answer == "FALSE":
+        for attempt in range(1, max_attempts + 1):
+            if attempt == 1:
+                lm_for_attempt = lm
+                attempt_model = str(getattr(lm_for_attempt, "model", model_chain[0]))
+            else:
+                model_index = min(attempt - 1, len(model_chain) - 1)
+                attempt_model = model_chain[model_index]
+                if attempt_model not in fallback_lms_by_model:
+                    fallback_lms_by_model[attempt_model] = dspy.LM(
+                        attempt_model,
+                        api_key=os.environ["OPEN_ROUTER_API_KEY"],
+                    )
+                lm_for_attempt = fallback_lms_by_model[attempt_model]
+
+            LOGGER.info(
+                "Отправили запрос с промптом на OpenRouter (попытка %d/%d, модель=%s).",
+                attempt,
+                max_attempts,
+                attempt_model,
+            )
+            response = lm_for_attempt(prompt, temperature=0)
+            LOGGER.info("Получили ответ от OpenRouter.")
+            parsed_answer = _parse_bool_answer(response)
+
+            LOGGER.info("Парсер ответ.")
+            if parsed_answer is not None:
+                return parsed_answer
+
+            should_retry = (
+                attempt < max_attempts
+                and _is_empty_or_truncated_response(response)
+            )
+            if should_retry:
+                LOGGER.warning(
+                    "LLM вернул пустой/обрезанный ответ (попытка %d/%d): %r. Повторяем запрос.",
+                    attempt,
+                    max_attempts,
+                    response,
+                )
+                if retry_delay_sec > 0:
+                    sleep(retry_delay_sec)
+                continue
+
+            LOGGER.warning("LLM вернул нераспознанный ответ при сравнении ВУЗов: %r", response)
             return False
-        else:
-            # Если ответ нечёткий — консервативно возвращаем False
-            return False
+
+        return False
             
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(
+        LOGGER.warning(
             f"Ошибка при сравнении названий ВУЗов через LLM: {e}"
         )
         return False

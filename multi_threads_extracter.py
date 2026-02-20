@@ -9,20 +9,43 @@ import dspy
 from transfer_excel_data import transfer_excel_data, transfer_reporting_data_to_excel, transfer_extracted_data_and_logic_to_excel
 from extract_fields import build_trainset, compile_extractor, extract_fields_from_text, ExtractedFields, Extractor
 
-DIRECTORY = Path("extracted_texts")
+DIRECTORY = Path("extracted_texts2")
 TRAIN_JSONL: Path | None = None  # например: Path("train_data.jsonl")
-MAX_FILES_TO_PROCESS = 10
-MAX_WORKERS = 10  # Количество потоков
+MAX_FILES_TO_PROCESS = 100
+MAX_WORKERS = 20  # Количество потоков
 LOGGER = logging.getLogger(__name__)
+OPENROUTER_MODEL = "openrouter/qwen/qwen3-30b-a3b"
 
 # Блокировка для потокобезопасной работы с Excel
 excel_lock = threading.Lock()
+thread_state = threading.local()
 
 REPORTING_DATES_BY_MONTH = {
+    "01": "ЯНВАРЬ!",
+    "02": "ФЕВРАЛЬ!",
+    "03": "МАРТ!",
+    "04": "АПРЕЛЬ!",
+    "05": "МАЙ!",
+    "06": "ИЮНЬ!",
     "07": "ИЮЛЬ;АВГУСТ;СЕНТЯБРЬ",
     "08": "АВГУСТ;СЕНТЯБРЬ",
     "09": "СЕНТЯБРЬ",
+    "10": "ОКТЯБРЬ!",
+    "11": "НОЯБРЬ!",
+    "12": "ДЕКАБРЬ!",
 }
+
+
+def _build_lm() -> dspy.LM:
+    return dspy.LM(OPENROUTER_MODEL, api_key=os.environ["OPEN_ROUTER_API_KEY"])
+
+
+def get_thread_lm() -> dspy.LM:
+    lm = getattr(thread_state, "lm", None)
+    if lm is None:
+        lm = _build_lm()
+        thread_state.lm = lm
+    return lm
 
 
 def parse_contract_month(contract_date: str | None) -> str | None:
@@ -90,6 +113,7 @@ def process_single_file(args: tuple) -> bool:
     thread_name = threading.current_thread().name
     
     try:
+        thread_lm = get_thread_lm()
         LOGGER.info(f"[{thread_name}] Текстовый файл №{i}: {text.name}")
         
         stem = text.stem  # "2025-06-05 12345"
@@ -100,7 +124,8 @@ def process_single_file(args: tuple) -> bool:
         
         educational_loan_agreement_date, educational_loan_agreement_number = stem_parts
 
-        result: ExtractedFields = extract_fields_from_text(compiled_extractor, text)
+        with dspy.context(lm=thread_lm):
+            result: ExtractedFields = extract_fields_from_text(compiled_extractor, text)
         LOGGER.info(
             f"[{thread_name}] Поля извлечены для договора {educational_loan_agreement_number} от {educational_loan_agreement_date}"
         )
@@ -135,7 +160,8 @@ def process_single_file(args: tuple) -> bool:
             if not transfer_extracted_data_and_logic_to_excel(
                 educational_loan_agreement_number, 
                 educational_loan_agreement_date, 
-                result
+                result,
+                thread_lm
             ):
                 LOGGER.error(
                     f"[{thread_name}] Проблемы с заполнением полей от LLM/логики вывода для договора "
@@ -168,8 +194,8 @@ def main() -> int:
 
     # Извлекаем все необходимые поля
     # Настраиваем LLM для DSPy (один раз)
-    lm = dspy.LM("openrouter/qwen/qwen3-30b-a3b", api_key=os.environ["OPEN_ROUTER_API_KEY"])
-    dspy.configure(lm=lm)
+    startup_lm = _build_lm()
+    dspy.configure(lm=startup_lm)
 
     compiled_extractor = build_compiled_extractor(TRAIN_JSONL)
 
@@ -179,6 +205,8 @@ def main() -> int:
     all_texts = sorted(DIRECTORY.glob("*.txt"))
     if not all_texts:
         raise FileNotFoundError(f"No text files found in: {DIRECTORY}")
+    
+    # all_texts = all_texts[:MAX_FILES_TO_PROCESS]
     
     LOGGER.info("Найдено %d Текстовых файлов.", len(all_texts))
     # all_texts = all_texts[:MAX_FILES_TO_PROCESS]
@@ -215,6 +243,7 @@ def main() -> int:
     LOGGER.info("Обработка завершена!")
     LOGGER.info("Успешно: %d, Ошибок: %d, Всего: %d", success_count, error_count, len(all_texts))
     LOGGER.info("=" * 50)
+    LOGGER.info("slavik........")
 
     return 0
 
