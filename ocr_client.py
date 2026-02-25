@@ -2,6 +2,8 @@ import base64
 import logging
 import os
 import re
+from datetime import datetime
+from pathlib import Path
 from time import perf_counter, sleep
 from dataclasses import dataclass
 
@@ -12,7 +14,7 @@ import dspy
 LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://ocr.g-309.ru"
-OPENAI_BASE_URL = "http://10.14.49.32:31751/v1"
+OPENAI_BASE_URL = "http://10.14.49.32:32204/v1"
 OPENAI_API_KEY = ""
 
 @dataclass
@@ -69,6 +71,225 @@ def extract_text_from_image_with_qwen3_vl(file_name: str) -> OcrClientResponse:
         )
         return OcrClientResponse(text=None, success=False)
     
+
+# def extract_paid_edu_contract_date_from_image_with_ocr(file_name: str) -> ResponsExtractPaidEduContractDateFromImage:
+#     """
+#         Необходимо повторно попытаться достать дату заключения договора из изображения.
+#     """
+#     prompt = f"""
+#         Необходимо досать дату договора, 
+#         чаще всего дата договора находиться справа свехрху без подписи, что это дата договора,
+#         в формате день: число в кавычках "" или << >>, 
+#         месяц: может быть как числом так и словом,
+#         год: четерех значаное число. 
+
+#         Так же дата заключения договора может находиться и в самом документе, нужно досать именно дату заключения договора.
+#         Бывают даты действия закона или каких то иных нормативных актов.
+
+#         Результат строго дата в формате XX:XX:XXXX - день:месяц:год
+#         """
+#     with open(file_name, "rb") as f:
+#         r = requests.post(f"{BASE_URL}/api/v1/ocr", files={"uploaded_file": f}, timeout=120)
+#     r.raise_for_status()
+#     payload = r.json()
+#     return ResponsExtractPaidEduContractDateFromImage(text=payload.get("text"), success=bool(payload.get("success")))
+
+
+CONTRACT_DATE_PROMPT = """
+Ты анализируешь изображение договора.
+Нужно извлечь именно дату заключения договора об оказании платных образовательных услуг.
+
+Правила:
+1) Игнорируй даты законов, лицензий, приказов, доверенностей, приложений и иных документов.
+2) Если на изображении несколько дат, выбери только дату заключения договора.
+3) Верни ответ строго в одном из форматов:
+   - YYYY-MM-DD, если дату можно определить однозначно;
+   - ОШИБКА, если дата не найдена или есть сомнения.
+4) Не добавляй пояснения, только итоговое значение.
+""".strip()
+
+IMAGE_MIME_TYPES: dict[str, str] = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+RU_MONTH_TO_NUMBER: dict[str, int] = {
+    "январь": 1, "января": 1,
+    "февраль": 2, "февраля": 2,
+    "март": 3, "марта": 3,
+    "апрель": 4, "апреля": 4,
+    "май": 5, "мая": 5,
+    "июнь": 6, "июня": 6,
+    "июль": 7, "июля": 7,
+    "август": 8, "августа": 8,
+    "сентябрь": 9, "сентября": 9,
+    "октябрь": 10, "октября": 10,
+    "ноябрь": 11, "ноября": 11,
+    "декабрь": 12, "декабря": 12,
+}
+
+DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?P<year>\d{4})[./-](?P<month>\d{1,2})[./-](?P<day>\d{1,2})\b"),
+    re.compile(r"\b(?P<day>\d{1,2})[./-](?P<month>\d{1,2})[./-](?P<year>\d{4})\b"),
+    re.compile(
+        r"\b(?P<day>\d{1,2})\s+(?P<month>[а-яa-zё]{3,})\s+(?P<year>\d{4})\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+@dataclass
+class ResponseExtractPaidEduContractDateFromImage:
+    date: str | None
+    success: bool
+
+
+def extract_paid_edu_contract_date_from_image_with_qwen3_vl(file_name: str) -> ResponseExtractPaidEduContractDateFromImage:
+    """Извлекает дату заключения договора из изображения и нормализует её в YYYY-MM-DD."""
+    def _guess_image_mime_type(file_name: str) -> str:
+        return IMAGE_MIME_TYPES.get(Path(file_name).suffix.lower(), "image/jpeg")
+
+    def _chat_content_to_text(content: object) -> str | None:
+        if isinstance(content, str):
+            text = content.strip()
+            return text or None
+
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text_value = item.get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    parts.append(text_value.strip())
+            joined = "\n".join(parts).strip()
+            return joined or None
+
+        return None
+
+    def _parse_month(month_token: str) -> int | None:
+        token = month_token.strip().lower().replace("ё", "е").rstrip(".")
+        if token.isdigit():
+            month = int(token)
+            return month if 1 <= month <= 12 else None
+        return RU_MONTH_TO_NUMBER.get(token)
+
+    def _normalize_to_iso_date(day: int, month: int, year: int) -> str | None:
+        if not (1900 <= year <= 2100):
+            return None
+        try:
+            return datetime(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    def _extract_date_candidates(raw_text: str) -> list[str]:
+        if not raw_text:
+            return []
+
+        prepared_text = re.sub(r"[«»\"“”„‟']", " ", raw_text)
+        prepared_text = re.sub(r"\bг\.?\b", " ", prepared_text, flags=re.IGNORECASE)
+        prepared_text = re.sub(r"\s+", " ", prepared_text).strip()
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for pattern in DATE_PATTERNS:
+            for match in pattern.finditer(prepared_text):
+                day = int(match.group("day"))
+                year = int(match.group("year"))
+                month = _parse_month(match.group("month"))
+                if month is None:
+                    continue
+
+                normalized = _normalize_to_iso_date(day=day, month=month, year=year)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    candidates.append(normalized)
+        return candidates
+    
+    def _short_log_text(value: str, limit: int = 220) -> str:
+        compact = re.sub(r"\s+", " ", value).strip()
+        if len(compact) <= limit:
+            return compact
+        return f"{compact[:limit]}..."
+    
+
+
+    timeout_sec = float(os.getenv("OCR_VL_TIMEOUT_SEC", "90"))
+    max_retries = int(os.getenv("OCR_VL_MAX_RETRIES", "0"))
+    model_name = os.getenv("OCR_VL_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
+
+    client = OpenAI(
+        base_url=OPENAI_BASE_URL,
+        api_key=OPENAI_API_KEY,
+        timeout=timeout_sec,
+        max_retries=max_retries,
+    )
+
+    try:
+        with open(file_name, "rb") as f:
+            image_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+        image_mime = _guess_image_mime_type(file_name)
+        response = client.chat.completions.create(
+            model=model_name,
+            timeout=timeout_sec,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": CONTRACT_DATE_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_base64}"}},
+                ],
+            }],
+        )
+
+        raw_text: str | None = None
+        if getattr(response, "choices", None):
+            raw_text = _chat_content_to_text(response.choices[0].message.content)
+
+        if not raw_text:
+            LOGGER.warning("Qwen3-VL returned empty response for contract date: %s", file_name)
+            return ResponseExtractPaidEduContractDateFromImage(date=None, success=False)
+
+        if raw_text.strip().upper() == "ОШИБКА":
+            return ResponseExtractPaidEduContractDateFromImage(date=None, success=False)
+
+        date_candidates = _extract_date_candidates(raw_text)
+        if len(date_candidates) == 1:
+            return ResponseExtractPaidEduContractDateFromImage(date=date_candidates[0], success=True)
+
+        if len(date_candidates) > 1:
+            LOGGER.warning(
+                "Qwen3-VL returned multiple date candidates for %s: %s; response=%s",
+                file_name,
+                date_candidates,
+                _short_log_text(raw_text),
+            )
+            return ResponseExtractPaidEduContractDateFromImage(date=None, success=False)
+
+        LOGGER.warning(
+            "Qwen3-VL did not return a parsable contract date for %s: %s",
+            file_name,
+            _short_log_text(raw_text),
+        )
+        return ResponseExtractPaidEduContractDateFromImage(date=None, success=False)
+
+    except Exception as e:
+        LOGGER.error(
+            "Qwen3-VL contract-date OCR failed for %s (model=%s, timeout=%ss, retries=%s): %s",
+            file_name,
+            model_name,
+            timeout_sec,
+            max_retries,
+            e,
+        )
+        return ResponseExtractPaidEduContractDateFromImage(date=None, success=False)
+        
 
 def _parse_bool_answer(raw_response: object) -> bool | None:
     if isinstance(raw_response, list):

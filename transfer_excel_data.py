@@ -11,6 +11,7 @@ import dspy
 from extract_fields import ExtractedFields
 from utils import _norm as _norm_text, _norm_code
 from ocr_client import check_university_name_llm
+from prompt_settings import ERROR_TOKEN
 
 import logging
 LOGGER = logging.getLogger(__name__)
