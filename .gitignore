@@ -20,3 +20,10 @@ wheels/
 /test_images
 /extracted_texts2
 
+*.zip
+*.bak
+
+agreements0-1000
+agreements1001-1750
+agreements1751-2350
+agreements2351-2828
