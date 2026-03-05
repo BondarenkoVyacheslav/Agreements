@@ -8,6 +8,7 @@ import threading
 import dspy
 from transfer_excel_data import transfer_excel_data, transfer_reporting_data_to_excel, transfer_extracted_data_and_logic_to_excel
 from extract_fields import build_trainset, compile_extractor, extract_fields_from_text, ExtractedFields, Extractor
+from extract_field_data_with_qwen_vl import extract_filed_data_with_qwen_vl
 
 DIRECTORY = Path("extracted_texts2")
 TRAIN_JSONL: Path | None = None  # например: Path("train_data.jsonl")
@@ -130,6 +131,10 @@ def process_single_file(args: tuple) -> bool:
             f"[{thread_name}] Поля извлечены для договора {educational_loan_agreement_number} от {educational_loan_agreement_date}"
         )
         LOGGER.debug(f"[{thread_name}] Извлечённые данные: {result}")
+
+        # Тут необходимо доп. проверка даты, если дата не была поймана с первого раза ocr-ом, необходимо еще раз попробовать qwen_vl
+        result = extract_filed_data_with_qwen_vl(stem, result)
+
 
         # Заполняем поле 9 согласно дате заключения договора
         month = parse_contract_month(result.paid_edu_contract_date)
