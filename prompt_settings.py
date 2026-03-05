@@ -47,6 +47,12 @@ class StrictContractExtraction(dspy.Signature):
     6) specialty_code строго формата NN.NN.NN, иначе ОШИБКА.
     7) Для каждого поля верни короткий evidence-фрагмент (1-2 строки) из текста.
        Если поле равно ОШИБКА, evidence по этому полю тоже ОШИБКА.
+    8) Специальный случай для ФИО: если в тексте явно найден только заказчик
+       (customer_fio), а отдельного ФИО обучающегося нет, считай, что
+       обучающийся и заказчик — одно лицо:
+       - student_fio = customer_fio;
+       - evidence_student_fio = evidence_customer_fio;
+       - это правило приоритетнее возврата ОШИБКА для student_fio в таком кейсе.
     """
 
     relevant_fragments: str = dspy.InputField(
@@ -56,7 +62,7 @@ class StrictContractExtraction(dspy.Signature):
         desc="Полное наименование ВУЗа/Исполнителя или ОШИБКА."
     )
     student_fio: str = dspy.OutputField(
-        desc="ФИО обучающегося (полностью) или ОШИБКА."
+        desc="ФИО обучающегося (полностью) или ОШИБКА. Если обучающийся не указан отдельно, но есть customer_fio, верни то же ФИО."
     )
     customer_fio: str = dspy.OutputField(
         desc="ФИО заказчика (полностью) или ОШИБКА."
