@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from extract_fields import ExtractedFields
@@ -6,9 +8,27 @@ from ocr_client import ResponseExtractPaidEduContractDateFromImage, extract_paid
 import logging
 
 DIRECTORY_WITH_IMAGES = Path("agreements")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
 LOGGER = logging.getLogger(__name__)
 
-def extract_filed_data_with_qwen_vl(stem: str, extracted_fields: ExtractedFields) -> ExctractedFields:
+
+def _resolve_image_path(stem: str, image_path: Path | None) -> Path:
+    if image_path is not None:
+        return image_path
+
+    for extension in IMAGE_EXTENSIONS:
+        candidate = DIRECTORY_WITH_IMAGES / f"{stem}{extension}"
+        if candidate.exists():
+            return candidate
+
+    return DIRECTORY_WITH_IMAGES / f"{stem}.jpg"
+
+
+def extract_filed_data_with_qwen_vl(
+    stem: str,
+    extracted_fields: ExtractedFields,
+    image_path: Path | None = None,
+) -> ExtractedFields:
     """
     Если не удалось с помощью ocr достать поле data, пробуем еще раз с помощью qwen_vl
     """
@@ -17,7 +37,7 @@ def extract_filed_data_with_qwen_vl(stem: str, extracted_fields: ExtractedFields
         return extracted_fields
 
     if (extracted_fields.university_name != ERROR_TOKEN or extracted_fields.student_fio != ERROR_TOKEN or extracted_fields.customer_fio != ERROR_TOKEN or extracted_fields.paid_edu_contract_number != ERROR_TOKEN or extracted_fields.specialty_code != ERROR_TOKEN) and extracted_fields.paid_edu_contract_date == ERROR_TOKEN:
-        image_path = DIRECTORY_WITH_IMAGES / f"{stem}.jpg"
+        image_path = _resolve_image_path(stem, image_path)
         LOGGER.info("Дата не была найдена ocr, делаем запрос модельке qwen_vl, чтобы достать дату.")
         response_vl: ResponseExtractPaidEduContractDateFromImage = extract_paid_edu_contract_date_from_image_with_qwen3_vl(image_path)
         LOGGER.info("Получили ответ от qwen_vl.")

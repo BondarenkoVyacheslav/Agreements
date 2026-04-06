@@ -7,15 +7,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import dspy
 from transfer_excel_data import transfer_excel_data, transfer_reporting_data_to_excel, transfer_extracted_data_and_logic_to_excel
-from extract_fields import build_trainset, compile_extractor, extract_fields_from_text, ExtractedFields, Extractor
+from extract_fields import (
+    build_trainset,
+    compile_extractor,
+    extract_fields_from_image_with_qwen3_vl_ocr,
+    ExtractedFields,
+    Extractor,
+)
 from extract_field_data_with_qwen_vl import extract_filed_data_with_qwen_vl
 
-DIRECTORY = Path("extracted_texts2")
+DIRECTORY = Path("agreements")
 TRAIN_JSONL: Path | None = None  # например: Path("train_data.jsonl")
 MAX_FILES_TO_PROCESS = 100
-MAX_WORKERS = 20  # Количество потоков
+MAX_WORKERS = 5  # Количество потоков
 LOGGER = logging.getLogger(__name__)
 OPENROUTER_MODEL = "openrouter/qwen/qwen3-30b-a3b"
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff")
 
 # Блокировка для потокобезопасной работы с Excel
 excel_lock = threading.Lock()
@@ -104,36 +111,43 @@ def build_compiled_extractor(train_path: Path | None) -> dspy.Module:
     return compile_extractor(trainset)
 
 
+def _list_input_images(directory: Path) -> list[Path]:
+    return sorted(
+        path for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+
+
 def process_single_file(args: tuple) -> bool:
     """
-    Обработка одного файла в отдельном потоке.
-    :param args: кортеж (index, text_file_path, compiled_extractor)
+    Обработка одного изображения в отдельном потоке.
+    :param args: кортеж (index, image_file_path, compiled_extractor)
     :return: True если успешно, False если ошибка
     """
-    i, text, compiled_extractor = args
+    i, image_path, compiled_extractor = args
     thread_name = threading.current_thread().name
     
     try:
         thread_lm = get_thread_lm()
-        LOGGER.info(f"[{thread_name}] Текстовый файл №{i}: {text.name}")
+        LOGGER.info(f"[{thread_name}] Изображение №{i}: {image_path.name}")
         
-        stem = text.stem  # "2025-06-05 12345"
+        stem = image_path.stem
         stem_parts = stem.replace("_", "  ").split(maxsplit=1)
         if len(stem_parts) < 2:
-            LOGGER.error(f"[{thread_name}] Пропуск файла с невалидным именем: {text.name}")
+            LOGGER.error(f"[{thread_name}] Пропуск файла с невалидным именем: {image_path.name}")
             return False
         
         educational_loan_agreement_date, educational_loan_agreement_number = stem_parts
 
         with dspy.context(lm=thread_lm):
-            result: ExtractedFields = extract_fields_from_text(compiled_extractor, text)
+            result: ExtractedFields = extract_fields_from_image_with_qwen3_vl_ocr(compiled_extractor, str(image_path))
         LOGGER.info(
             f"[{thread_name}] Поля извлечены для договора {educational_loan_agreement_number} от {educational_loan_agreement_date}"
         )
         LOGGER.debug(f"[{thread_name}] Извлечённые данные: {result}")
 
         # Тут необходимо доп. проверка даты, если дата не была поймана с первого раза ocr-ом, необходимо еще раз попробовать qwen_vl
-        result = extract_filed_data_with_qwen_vl(stem, result)
+        result = extract_filed_data_with_qwen_vl(stem, result, image_path)
 
 
         # Заполняем поле 9 согласно дате заключения договора
@@ -181,7 +195,7 @@ def process_single_file(args: tuple) -> bool:
         
     except Exception:
         LOGGER.exception(
-            f"[{thread_name}] Необработанная ошибка при обработке файла {text}. Переходим к следующему."
+            f"[{thread_name}] Необработанная ошибка при обработке файла {image_path}. Переходим к следующему."
         )
         return False
 
@@ -207,18 +221,18 @@ def main() -> int:
     if not DIRECTORY.exists():
         raise FileNotFoundError(f"Images directory not found: {DIRECTORY}")
 
-    all_texts = sorted(DIRECTORY.glob("*.txt"))
-    if not all_texts:
-        raise FileNotFoundError(f"No text files found in: {DIRECTORY}")
+    all_images = _list_input_images(DIRECTORY)
+    if not all_images:
+        raise FileNotFoundError(f"No image files found in: {DIRECTORY}")
     
-    # all_texts = all_texts[:MAX_FILES_TO_PROCESS]
+    # all_images = all_images[:MAX_FILES_TO_PROCESS]
     
-    LOGGER.info("Найдено %d Текстовых файлов.", len(all_texts))
-    # all_texts = all_texts[:MAX_FILES_TO_PROCESS]
-    LOGGER.info("Будет обработано %d файлов в %d потоках.", len(all_texts), MAX_WORKERS)
+    LOGGER.info("Найдено %d изображений.", len(all_images))
+    # all_images = all_images[:MAX_FILES_TO_PROCESS]
+    LOGGER.info("Будет обработано %d файлов в %d потоках.", len(all_images), MAX_WORKERS)
 
     # Подготовка аргументов для потоков
-    tasks = [(i, text, compiled_extractor) for i, text in enumerate(all_texts)]
+    tasks = [(i, image_path, compiled_extractor) for i, image_path in enumerate(all_images)]
     
     # Запуск пула потоков
     success_count = 0
@@ -231,22 +245,22 @@ def main() -> int:
         # Обрабатываем результаты по мере завершения
         for future in as_completed(future_to_task):
             task = future_to_task[future]
-            i, text, _ = task
+            i, image_path, _ = task
             try:
                 result = future.result()
                 if result:
                     success_count += 1
-                    LOGGER.info(f"Файл №{i} ({text.name}) успешно обработан.")
+                    LOGGER.info(f"Файл №{i} ({image_path.name}) успешно обработан.")
                 else:
                     error_count += 1
-                    LOGGER.warning(f"Файл №{i} ({text.name}) обработан с ошибками.")
+                    LOGGER.warning(f"Файл №{i} ({image_path.name}) обработан с ошибками.")
             except Exception as e:
                 error_count += 1
-                LOGGER.exception(f"Файл №{i} ({text.name}) вызвал исключение: {e}")
+                LOGGER.exception(f"Файл №{i} ({image_path.name}) вызвал исключение: {e}")
 
     LOGGER.info("=" * 50)
     LOGGER.info("Обработка завершена!")
-    LOGGER.info("Успешно: %d, Ошибок: %d, Всего: %d", success_count, error_count, len(all_texts))
+    LOGGER.info("Успешно: %d, Ошибок: %d, Всего: %d", success_count, error_count, len(all_images))
     LOGGER.info("=" * 50)
     LOGGER.info("slavik........")
 

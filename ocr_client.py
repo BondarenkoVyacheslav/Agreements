@@ -71,6 +71,15 @@ def extract_text_from_image_with_qwen3_vl(file_name: str) -> OcrClientResponse:
         )
         return OcrClientResponse(text=None, success=False)
     
+def extract_fields_with_qwen_35b() -> OcrClientResponse:
+    """Кидает запрос на сервер для извлечения полей из релевантных фрагментов с помощью модели Qwen3.5-35b-a3b-ud-q8_k_xl."""
+    client = OpenAI(
+        base_url=os.getenv("API_URL", ""),
+        api_key=os.getenv("API_KEY", ""),
+    )
+    pass
+
+    
 
 # def extract_paid_edu_contract_date_from_image_with_ocr(file_name: str) -> ResponsExtractPaidEduContractDateFromImage:
 #     """
@@ -466,6 +475,9 @@ def check_university_name_llm(cell_university_name: str, university_name: str, l
             f"Ошибка при сравнении названий ВУЗов через LLM: {e}"
         )
         return False
+
+
+
 
     
 

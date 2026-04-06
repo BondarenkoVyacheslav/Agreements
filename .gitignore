@@ -21,9 +21,11 @@ wheels/
 /extracted_texts2
 
 *.zip
-*.bak
+*.bakmulti_threads_extracter.py
 
 agreements0-1000
 agreements1001-1750
 agreements1751-2350
 agreements2351-2828
+A2/
+А2/

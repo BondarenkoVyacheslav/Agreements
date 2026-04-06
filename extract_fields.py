@@ -2,13 +2,16 @@ import dspy
 from dspy.teleprompt import BootstrapFewShot
 from typing import Optional, List
 from pathlib import Path
-from ocr_client import extract_text_from_image, OcrClientResponse
 from utils import metric
 import json
 from pydantic import BaseModel, Field
 from normalizes import _normalize_value, _normalize_date, _normalize_specialty, _normalize_evidence
 
-from ocr_client import OcrClientResponse, extract_text_from_image
+from ocr_client import (
+    OcrClientResponse,
+    extract_text_from_image,
+    extract_text_from_image_with_qwen3_vl,
+)
 from prompt_settings import ERROR_TOKEN, TwoStageExtractor
 
 
@@ -107,35 +110,26 @@ def compile_extractor(trainset: List[dspy.Example]) -> dspy.Module:
     return teleprompter.compile(Extractor(), trainset=trainset)
 
 
-def extract_fields(compiled_extractor: dspy.Module, file_name: str) -> ExtractedFields:
-    """
-       Вариант с OCR: достаем текст из изображения и извлекаем необходимые поля.
-    """
-    ocr_client_response: OcrClientResponse = extract_text_from_image(file_name=file_name)
+def _empty_extracted_fields() -> ExtractedFields:
+    return ExtractedFields(
+        university_name=ERROR_TOKEN,
+        student_fio=ERROR_TOKEN,
+        customer_fio=ERROR_TOKEN,
+        paid_edu_contract_number=ERROR_TOKEN,
+        paid_edu_contract_date=ERROR_TOKEN,
+        specialty_code=ERROR_TOKEN,
+        evidence={
+            "university_name": ERROR_TOKEN,
+            "student_fio": ERROR_TOKEN,
+            "customer_fio": ERROR_TOKEN,
+            "paid_edu_contract_number": ERROR_TOKEN,
+            "paid_edu_contract_date": ERROR_TOKEN,
+            "specialty_code": ERROR_TOKEN,
+        },
+    )
 
-    if not ocr_client_response.success or not ocr_client_response.text:
-        print("Ошибка извлечения текста!")
-        return ExtractedFields(
-            university_name=ERROR_TOKEN,
-            student_fio=ERROR_TOKEN,
-            customer_fio=ERROR_TOKEN,
-            paid_edu_contract_number=ERROR_TOKEN,
-            paid_edu_contract_date=ERROR_TOKEN,
-            specialty_code=ERROR_TOKEN,
-            evidence={
-                "university_name": ERROR_TOKEN,
-                "student_fio": ERROR_TOKEN,
-                "customer_fio": ERROR_TOKEN,
-                "paid_edu_contract_number": ERROR_TOKEN,
-                "paid_edu_contract_date": ERROR_TOKEN,
-                "specialty_code": ERROR_TOKEN,
-            },
-        )
 
-    text = ocr_client_response.text
-
-    pred = compiled_extractor(text=text)
-
+def _build_extracted_fields_from_prediction(pred: object) -> ExtractedFields:
     university_name = _normalize_value(getattr(pred, "university_name", ERROR_TOKEN))
     student_fio = _normalize_value(getattr(pred, "student_fio", ERROR_TOKEN))
     customer_fio = _normalize_value(getattr(pred, "customer_fio", ERROR_TOKEN))
@@ -167,6 +161,37 @@ def extract_fields(compiled_extractor: dspy.Module, file_name: str) -> Extracted
         specialty_code=specialty_code,
         evidence=evidence,
     )
+
+
+def extract_fields_from_text_content(compiled_extractor: dspy.Module, text: str) -> ExtractedFields:
+    if not text or not text.strip():
+        return _empty_extracted_fields()
+
+    pred = compiled_extractor(text=text.strip())
+    return _build_extracted_fields_from_prediction(pred)
+
+
+def extract_fields(compiled_extractor: dspy.Module, file_name: str) -> ExtractedFields:
+    """
+       Вариант с OCR: достаем текст из изображения и извлекаем необходимые поля.
+    """
+    ocr_client_response: OcrClientResponse = extract_text_from_image(file_name=file_name)
+
+    if not ocr_client_response.success or not ocr_client_response.text:
+        print("Ошибка извлечения текста!")
+        return _empty_extracted_fields()
+
+    return extract_fields_from_text_content(compiled_extractor, ocr_client_response.text)
+
+
+def extract_fields_from_image_with_qwen3_vl_ocr(compiled_extractor: dspy.Module, file_name: str) -> ExtractedFields:
+    ocr_client_response: OcrClientResponse = extract_text_from_image_with_qwen3_vl(file_name=file_name)
+
+    if not ocr_client_response.success or not ocr_client_response.text:
+        print("Ошибка извлечения текста через Qwen3-VL OCR!")
+        return _empty_extracted_fields()
+
+    return extract_fields_from_text_content(compiled_extractor, ocr_client_response.text)
 
 
 def extract_fields_from_text(compiled_extractor: dspy.Module, file_name: str) -> ExtractedFields:
@@ -189,97 +214,20 @@ def extract_fields_from_text(compiled_extractor: dspy.Module, file_name: str) ->
 
     if not text_file_path.exists():
         print(f"Файл с извлеченным текстом не найден: {text_file_path}")
-        return ExtractedFields(
-            university_name=ERROR_TOKEN,
-            student_fio=ERROR_TOKEN,
-            customer_fio=ERROR_TOKEN,
-            paid_edu_contract_number=ERROR_TOKEN,
-            paid_edu_contract_date=ERROR_TOKEN,
-            specialty_code=ERROR_TOKEN,
-            evidence={
-                "university_name": ERROR_TOKEN,
-                "student_fio": ERROR_TOKEN,
-                "customer_fio": ERROR_TOKEN,
-                "paid_edu_contract_number": ERROR_TOKEN,
-                "paid_edu_contract_date": ERROR_TOKEN,
-                "specialty_code": ERROR_TOKEN,
-            },
-        )
+        return _empty_extracted_fields()
 
     with open(file=text_file_path, mode="r", encoding="utf-8") as f:
         text = f.read().strip()
 
     if text == "Processing failed: request timed out":
         print(f"Файл с извлеченным текстом пуст: {text_file_path}. Содержимое файла {text}: ")
-        return ExtractedFields(
-            university_name=ERROR_TOKEN,
-            student_fio=ERROR_TOKEN,
-            customer_fio=ERROR_TOKEN,
-            paid_edu_contract_number=ERROR_TOKEN,
-            paid_edu_contract_date=ERROR_TOKEN,
-            specialty_code=ERROR_TOKEN,
-            evidence={
-                "university_name": ERROR_TOKEN,
-                "student_fio": ERROR_TOKEN,
-                "customer_fio": ERROR_TOKEN,
-                "paid_edu_contract_number": ERROR_TOKEN,
-                "paid_edu_contract_date": ERROR_TOKEN,
-                "specialty_code": ERROR_TOKEN,
-            },
-        )
+        return _empty_extracted_fields()
 
     if not text:
         print(f"Файл с извлеченным текстом пуст: {text_file_path}")
-        return ExtractedFields(
-            university_name=ERROR_TOKEN,
-            student_fio=ERROR_TOKEN,
-            customer_fio=ERROR_TOKEN,
-            paid_edu_contract_number=ERROR_TOKEN,
-            paid_edu_contract_date=ERROR_TOKEN,
-            specialty_code=ERROR_TOKEN,
-            evidence={
-                "university_name": ERROR_TOKEN,
-                "student_fio": ERROR_TOKEN,
-                "customer_fio": ERROR_TOKEN,
-                "paid_edu_contract_number": ERROR_TOKEN,
-                "paid_edu_contract_date": ERROR_TOKEN,
-                "specialty_code": ERROR_TOKEN,
-            },
-        )
+        return _empty_extracted_fields()
 
-    pred = compiled_extractor(text=text)
-
-    university_name = _normalize_value(getattr(pred, "university_name", ERROR_TOKEN))
-    student_fio = _normalize_value(getattr(pred, "student_fio", ERROR_TOKEN))
-    customer_fio = _normalize_value(getattr(pred, "customer_fio", ERROR_TOKEN))
-    paid_edu_contract_number = _normalize_value(getattr(pred, "paid_edu_contract_number", ERROR_TOKEN))
-    paid_edu_contract_date = _normalize_date(getattr(pred, "paid_edu_contract_date", ERROR_TOKEN))
-    specialty_code = _normalize_specialty(getattr(pred, "specialty_code", ERROR_TOKEN))
-
-    evidence = {
-        "university_name": _normalize_evidence(getattr(pred, "evidence_university_name", ERROR_TOKEN), university_name),
-        "student_fio": _normalize_evidence(getattr(pred, "evidence_student_fio", ERROR_TOKEN), student_fio),
-        "customer_fio": _normalize_evidence(getattr(pred, "evidence_customer_fio", ERROR_TOKEN), customer_fio),
-        "paid_edu_contract_number": _normalize_evidence(
-            getattr(pred, "evidence_paid_edu_contract_number", ERROR_TOKEN),
-            paid_edu_contract_number,
-        ),
-        "paid_edu_contract_date": _normalize_evidence(
-            getattr(pred, "evidence_paid_edu_contract_date", ERROR_TOKEN),
-            paid_edu_contract_date,
-        ),
-        "specialty_code": _normalize_evidence(getattr(pred, "evidence_specialty_code", ERROR_TOKEN), specialty_code),
-    }
-
-    return ExtractedFields(
-        university_name=university_name,
-        student_fio=student_fio,
-        customer_fio=customer_fio,
-        paid_edu_contract_number=paid_edu_contract_number,
-        paid_edu_contract_date=paid_edu_contract_date,
-        specialty_code=specialty_code,
-        evidence=evidence,
-    )
+    return extract_fields_from_text_content(compiled_extractor, text)
 
     
 
