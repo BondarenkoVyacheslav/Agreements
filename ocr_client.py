@@ -16,6 +16,26 @@ LOGGER = logging.getLogger(__name__)
 BASE_URL = "https://ocr.g-309.ru"
 OPENAI_BASE_URL = "http://10.14.49.32:32204/v1"
 OPENAI_API_KEY = ""
+LOCAL_TEXT_LLM_MODEL = "openai/qwen3.5-35b-a3b-ud-q8_k_xl"
+LOCAL_TEXT_LLM_MAX_TOKENS = 8192
+
+
+def normalize_local_api_base(api_url: str) -> str:
+    value = str(api_url).strip().rstrip("/")
+    if not value:
+        return value
+    if value.endswith("/v1"):
+        return value
+    return f"{value}/v1"
+
+
+def build_local_text_lm() -> dspy.LM:
+    return dspy.LM(
+        LOCAL_TEXT_LLM_MODEL,
+        api_base=normalize_local_api_base(os.environ["API_URL"]),
+        api_key=os.environ["API_KEY"],
+        max_tokens=LOCAL_TEXT_LLM_MAX_TOKENS,
+    )
 
 @dataclass
 class OcrClientResponse:
@@ -307,11 +327,10 @@ def _parse_bool_answer(raw_response: object) -> bool | None:
         raw_response = raw_response[0]
 
     if isinstance(raw_response, dict):
-        raw_text = str(
-            raw_response.get("text")
-            or raw_response.get("content")
-            or raw_response
-        )
+        raw_text_value = raw_response.get("text") or raw_response.get("content")
+        if raw_text_value is None:
+            return None
+        raw_text = str(raw_text_value)
     else:
         raw_text = str(raw_response)
 
@@ -355,15 +374,6 @@ def _is_empty_or_truncated_response(raw_response: object) -> bool:
     return False
 
 
-def _normalize_openrouter_model(model_name: str) -> str:
-    value = str(model_name).strip()
-    if not value:
-        return value
-    if value.startswith("openrouter/"):
-        return value
-    return f"openrouter/{value}"
-
-
 def check_university_name_llm(cell_university_name: str, university_name: str, lm: dspy.LM | None = None) -> bool:
     """Отправляет запрос LLM для сравнения названий университетов."""
     
@@ -375,19 +385,19 @@ def check_university_name_llm(cell_university_name: str, university_name: str, l
     if university_name.strip().upper() == "ОШИБКА":
         return False
     
-    # Инициализация LLM
-    model_chain = [
-        _normalize_openrouter_model(os.getenv("UNIVERSITY_CHECK_LLM_MODEL_1", "openrouter/qwen/qwen3-30b-a3b")),
-        _normalize_openrouter_model(os.getenv("UNIVERSITY_CHECK_LLM_MODEL_2", "openai/gpt-oss-120b")),
-        _normalize_openrouter_model(os.getenv("UNIVERSITY_CHECK_LLM_MODEL_3", "google/gemini-3-flash-preview")),
-    ]
-    model_chain = [model for model in model_chain if model]
-
+    local_api_base = normalize_local_api_base(os.environ["API_URL"])
     if lm is None:
-        lm = dspy.LM(
-            model_chain[0],
-            api_key=os.environ["OPEN_ROUTER_API_KEY"]
-        )
+        lm = build_local_text_lm()
+    else:
+        lm_model = str(getattr(lm, "model", "")).strip()
+        lm_api_base = str(
+            getattr(lm, "kwargs", {}).get("api_base")
+            or getattr(lm, "kwargs", {}).get("base_url")
+            or ""
+        ).strip()
+        if lm_model != LOCAL_TEXT_LLM_MODEL or lm_api_base.rstrip("/") != local_api_base.rstrip("/"):
+            LOGGER.info("Переданный LLM не локальный, используем локальный LLM-сервер для сравнения ВУЗов.")
+            lm = build_local_text_lm()
     
     
     # Формируем промпт прямо здесь
@@ -419,31 +429,19 @@ def check_university_name_llm(cell_university_name: str, university_name: str, l
     
     max_attempts = max(1, int(os.getenv("UNIVERSITY_CHECK_LLM_RETRIES", "3")))
     retry_delay_sec = max(0.0, float(os.getenv("UNIVERSITY_CHECK_LLM_RETRY_DELAY_SEC", "0.8")))
-    fallback_lms_by_model: dict[str, dspy.LM] = {}
-
     try:
         for attempt in range(1, max_attempts + 1):
-            if attempt == 1:
-                lm_for_attempt = lm
-                attempt_model = str(getattr(lm_for_attempt, "model", model_chain[0]))
-            else:
-                model_index = min(attempt - 1, len(model_chain) - 1)
-                attempt_model = model_chain[model_index]
-                if attempt_model not in fallback_lms_by_model:
-                    fallback_lms_by_model[attempt_model] = dspy.LM(
-                        attempt_model,
-                        api_key=os.environ["OPEN_ROUTER_API_KEY"],
-                    )
-                lm_for_attempt = fallback_lms_by_model[attempt_model]
+            lm_for_attempt = lm if attempt == 1 else build_local_text_lm()
+            attempt_model = str(getattr(lm_for_attempt, "model", LOCAL_TEXT_LLM_MODEL))
 
             LOGGER.info(
-                "Отправили запрос с промптом на OpenRouter (попытка %d/%d, модель=%s).",
+                "Отправили запрос с промптом на локальный LLM-сервер (попытка %d/%d, модель=%s).",
                 attempt,
                 max_attempts,
                 attempt_model,
             )
             response = lm_for_attempt(prompt, temperature=0)
-            LOGGER.info("Получили ответ от OpenRouter.")
+            LOGGER.info("Получили ответ от локального LLM-сервера.")
             parsed_answer = _parse_bool_answer(response)
 
             LOGGER.info("Парсер ответ.")
@@ -472,7 +470,7 @@ def check_university_name_llm(cell_university_name: str, university_name: str, l
             
     except Exception as e:
         LOGGER.warning(
-            f"Ошибка при сравнении названий ВУЗов через LLM: {e}"
+            f"Ошибка при сравнении названий ВУЗов через локальный LLM-сервер: {e}"
         )
         return False
 

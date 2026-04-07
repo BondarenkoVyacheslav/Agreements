@@ -1,363 +1,356 @@
 from __future__ import annotations
 
-from contextlib import closing
+from copy import copy
+from datetime import date, datetime
+import logging
 from pathlib import Path
 import re
+from shutil import copy2
 
-from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font
 import dspy
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 from extract_fields import ExtractedFields
-from utils import _norm as _norm_text, _norm_code
 from ocr_client import check_university_name_llm
 from prompt_settings import ERROR_TOKEN
+from utils import _norm as _norm_text, _norm_code
 
-import logging
 LOGGER = logging.getLogger(__name__)
 
-SOURCE_PATH = Path("СВОД СБЕР июль-сентябрь.xlsx")
-TEMPLATE_PATH = Path("Шаблон_выгрузки.xlsx")
-OUTPUT_PATH = Path("СВОД_СБЕР_выгрузка.xlsx")
+TEMPLATE_PATH = Path("1448 декабрь в Сбер на проверку Шаблон.xlsx")
+HEADER_STYLE_TEMPLATE_PATH = Path("Шаблон_выгрузки.xlsx")
+OUTPUT_PATH = Path("1448 декабрь в Сбер на проверку Выгрузка.xlsx")
+WORKSHEET_NAME = "CustomQuery"
 DATA_START_ROW = 2
 
+EXCEL_CONTRACT_COLUMN = 5  # E
+BASE_UNIVERSITY_COLUMN = 3  # C
+BASE_STUDENT_COLUMN = 4  # D
+BASE_SPECIALTY_COLUMN = 8  # H
+
+AI_OUTPUT_START_COLUMN = 11  # K
+AI_HEADERS_SOURCE_START_COLUMN = 23  # W
+AI_HEADERS_COUNT = 7
+AI_RESULT_COLUMN = AI_OUTPUT_START_COLUMN + AI_HEADERS_COUNT - 1  # Q
+
+NUMBER_FIRST_STEM_PATTERN = re.compile(r"^(?P<number>.+?)[_ ]+(?P<date>\d{1,2}\.\d{1,2}\.\d{4})$")
+DATE_FIRST_STEM_PATTERN = re.compile(r"^(?P<date>\d{1,2}\.\d{1,2}\.\d{4})[_ ]+(?P<number>.+?)$")
+DATE_ONLY_PATTERN = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
+DASH_PATTERN = re.compile(r"[‐‑‒–—―−]")
+
+
+def _get_output_worksheet(workbook):
+    if WORKSHEET_NAME in workbook.sheetnames:
+        return workbook[WORKSHEET_NAME]
+    return workbook.active
+
+
+def _copy_cell_style(source_cell, target_cell) -> None:
+    target_cell.font = copy(source_cell.font)
+    target_cell.fill = copy(source_cell.fill)
+    target_cell.border = copy(source_cell.border)
+    target_cell.alignment = copy(source_cell.alignment)
+    target_cell.protection = copy(source_cell.protection)
+    target_cell.number_format = source_cell.number_format
+
+
+def _safe_value(value: object) -> str:
+    if value is None:
+        return ERROR_TOKEN
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
+    text = str(value).strip()
+    return text if text else ERROR_TOKEN
+
+
+def _load_output_workbook():
+    try:
+        return load_workbook(OUTPUT_PATH)
+    except TypeError as exc:
+        if "extLst" not in str(exc):
+            raise
+        if transfer_excel_data() != 0:
+            raise RuntimeError(f"Failed to rebuild output workbook: {OUTPUT_PATH}") from exc
+        return load_workbook(OUTPUT_PATH)
+
+
+def _prepare_output_headers(ws_out, ws_style) -> None:
+    body_style_source = ws_out.cell(row=DATA_START_ROW, column=AI_OUTPUT_START_COLUMN)
+
+    for offset in range(AI_HEADERS_COUNT):
+        source_column = AI_HEADERS_SOURCE_START_COLUMN + offset
+        target_column = AI_OUTPUT_START_COLUMN + offset
+
+        source_header_cell = ws_style.cell(row=1, column=source_column)
+        target_header_cell = ws_out.cell(row=1, column=target_column, value=source_header_cell.value)
+        _copy_cell_style(source_header_cell, target_header_cell)
+
+        source_letter = get_column_letter(source_column)
+        target_letter = get_column_letter(target_column)
+        ws_out.column_dimensions[target_letter].width = ws_style.column_dimensions[source_letter].width
+
+        for row_index in range(DATA_START_ROW, ws_out.max_row + 1):
+            body_cell = ws_out.cell(row=row_index, column=target_column)
+            _copy_cell_style(body_style_source, body_cell)
+
+    ws_out.row_dimensions[1].height = ws_style.row_dimensions[1].height
+    ws_out.auto_filter.ref = f"A1:{get_column_letter(AI_RESULT_COLUMN)}1"
+
+
+def normalize_credit_contract_number(value: object) -> str:
+    if value is None:
+        return ""
+
+    normalized = str(value).strip().upper().rstrip(".")
+    if not normalized:
+        return ""
+
+    normalized = DASH_PATTERN.sub("-", normalized)
+    normalized = normalized.replace("/", "-").replace("\\", "-").replace("_", "-")
+    normalized = re.sub(r"\s+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    return normalized.strip("-.")
+
+
+def extract_credit_contract_number_from_excel_cell(value: object) -> str | None:
+    if value is None:
+        return None
+
+    parts = str(value).split()
+    if len(parts) < 2:
+        return None
+
+    contract_number = normalize_credit_contract_number(parts[1])
+    return contract_number or None
+
+
+def extract_credit_contract_number_from_document_name(path: Path | str) -> str | None:
+    stem = Path(path).stem.rstrip(".").strip()
+    if not stem or DATE_ONLY_PATTERN.fullmatch(stem) or not re.search(r"\d", stem):
+        return None
+
+    for pattern in (NUMBER_FIRST_STEM_PATTERN, DATE_FIRST_STEM_PATTERN):
+        match = pattern.fullmatch(stem)
+        if match:
+            contract_number = normalize_credit_contract_number(match.group("number"))
+            return contract_number or None
+
+    contract_number = normalize_credit_contract_number(stem)
+    return contract_number or None
+
+
+def find_matching_rows(ws, contract_number: str) -> list[int]:
+    normalized_contract_number = normalize_credit_contract_number(contract_number)
+    if not normalized_contract_number:
+        return []
+
+    matching_rows: list[int] = []
+    for row_index in range(DATA_START_ROW, ws.max_row + 1):
+        cell_value = ws.cell(row=row_index, column=EXCEL_CONTRACT_COLUMN).value
+        row_contract_number = extract_credit_contract_number_from_excel_cell(cell_value)
+        if row_contract_number == normalized_contract_number:
+            matching_rows.append(row_index)
+
+    return matching_rows
+
+
 def transfer_excel_data() -> int:
-    if not SOURCE_PATH.exists():
-        print(f"File not found: {SOURCE_PATH}")
-        return 1
     if not TEMPLATE_PATH.exists():
         print(f"File not found: {TEMPLATE_PATH}")
         return 1
+    if not HEADER_STYLE_TEMPLATE_PATH.exists():
+        print(f"File not found: {HEADER_STYLE_TEMPLATE_PATH}")
+        return 1
 
-    with closing(load_workbook(SOURCE_PATH, read_only=True, data_only=True)) as wb_src:
-        ws_src = wb_src.active
-        wb_out = load_workbook(TEMPLATE_PATH)
-        ws_out = wb_out.active
+    copy2(TEMPLATE_PATH, OUTPUT_PATH)
 
-        alignment = Alignment(horizontal="center", vertical="center")
-        font = Font(name="Times New Roman", size=12)
-
-        out_row = DATA_START_ROW
-        for i, row in enumerate(ws_src.iter_rows(values_only=True)):
-            if i == 0 or i == 1:
-                continue
-
-            position = row[0]
-            university_name = row[1]
-            full_name = row[2]
-            educational_loan_agreement_with_date_and_number = row[3]
-            code_of_study = row[6]
-            unique_id_agreement = row[7]
-            adjustment_sign = row[8]
-
-            educational_loan_agreement_date = educational_loan_agreement_with_date_and_number.split()[0]
-            educational_loan_agreement_number = educational_loan_agreement_with_date_and_number.split()[1]
-
-            values = [
-                position,
-                university_name,
-                full_name,
-                educational_loan_agreement_number,
-                educational_loan_agreement_date,
-                code_of_study,
-                unique_id_agreement,
-                adjustment_sign,
-            ]
-
-            for col_idx, value in enumerate(values, start=1):
-                cell = ws_out.cell(row=out_row, column=col_idx, value=value)
-                cell.alignment = alignment
-                cell.font = font
-
-            out_row += 1
-
+    wb_out = load_workbook(OUTPUT_PATH)
+    wb_style = load_workbook(HEADER_STYLE_TEMPLATE_PATH)
+    try:
+        ws_out = _get_output_worksheet(wb_out)
+        ws_style = wb_style.active
+        _prepare_output_headers(ws_out, ws_style)
         wb_out.save(OUTPUT_PATH)
+    finally:
+        wb_style.close()
         wb_out.close()
 
     return 0
 
 
-def transfer_reporting_data_to_excel(edu_loan_agr_num: str, edu_loan_agr_date: str, reporting_dates: str = "НЕ ОПРЕДЕЛЕНО") -> bool:
-    """Заполняем для нужного договора 9 графу с месяцами"""
+def transfer_reporting_data_to_excel(*_args, **_kwargs) -> bool:
+    LOGGER.warning("Логика reporting_dates отключена для новой декабрьской выгрузки.")
+    return False
+
+
+def _check_university_match(cell_name: str, ex_name: str, lm: dspy.LM | None = None) -> tuple[bool, str]:
+    if not cell_name or not ex_name:
+        return False, "Пустое название"
+
+    if cell_name.upper() == ERROR_TOKEN or ex_name.upper() == ERROR_TOKEN:
+        return False, "ОШИБКА в названии"
+
+    cell_norm = _norm_text(cell_name)
+    ex_norm = _norm_text(ex_name)
+
+    def _normalize_university_for_compare(value: str) -> str:
+        normalized = _norm_text(value)
+        normalized = re.sub(r"[^0-9A-ZА-Я]+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    def _quoted_core(value: str) -> str:
+        match = re.search(r"[«\"]([^»\"]+)[»\"]", str(value))
+        if not match:
+            return ""
+        return _norm_text(match.group(1))
+
+    if cell_norm == ex_norm:
+        return True, "Точное совпадение"
+
+    if cell_norm in ex_norm or ex_norm in cell_norm:
+        return True, "Одно в другом"
+
+    cell_soft_norm = _normalize_university_for_compare(cell_name)
+    ex_soft_norm = _normalize_university_for_compare(ex_name)
+    if cell_soft_norm == ex_soft_norm:
+        return True, "Совпадение после нормализации"
+    if cell_soft_norm in ex_soft_norm or ex_soft_norm in cell_soft_norm:
+        return True, "Одно в другом после нормализации"
+
+    cell_quoted_core = _quoted_core(cell_name)
+    ex_quoted_core = _quoted_core(ex_name)
+    if cell_quoted_core and ex_quoted_core and cell_quoted_core == ex_quoted_core:
+        return True, "Совпадение по названию в кавычках"
+
+    try:
+        llm_result = check_university_name_llm(cell_name, ex_name, lm)
+        LOGGER.info("Уточняем у LLM сходство названий вузов.")
+        if llm_result:
+            return True, "Совпадение по LLM"
+        return False, "Разные ВУЗы (LLM)"
+    except Exception as exc:
+        LOGGER.warning("Ошибка LLM при сравнении ВУЗов: %s", exc)
+        return False, "Ошибка LLM"
+
+
+def _build_ai_result(ws_out, row_index: int, ex_university: str, ex_student_fio: str, ex_specialty: str, lm: dspy.LM | None) -> str:
+    cell_university_name = ws_out.cell(row=row_index, column=BASE_UNIVERSITY_COLUMN).value
+    cell_fio = ws_out.cell(row=row_index, column=BASE_STUDENT_COLUMN).value
+    cell_cnp = ws_out.cell(row=row_index, column=BASE_SPECIALTY_COLUMN).value
+
+    messages: list[str] = []
+
+    cell_university_norm = _norm_text(str(cell_university_name) if cell_university_name is not None else "")
+    ex_university_norm = _norm_text(ex_university)
+    if cell_university_norm not in ("", ERROR_TOKEN) and ex_university_norm not in ("", ERROR_TOKEN):
+        is_match, _comment = _check_university_match(str(cell_university_name), ex_university, lm)
+        if not is_match:
+            messages.append("Иной вуз")
+
+    cell_fio_norm = _norm_text(str(cell_fio) if cell_fio is not None else "")
+    ex_fio_norm = _norm_text(ex_student_fio)
+    if cell_fio_norm not in ("", ERROR_TOKEN) and ex_fio_norm not in ("", ERROR_TOKEN):
+        cell_parts = cell_fio_norm.split()
+        ex_parts = ex_fio_norm.split()
+
+        cell_surname = cell_parts[0] if len(cell_parts) >= 1 else ""
+        cell_name = cell_parts[1] if len(cell_parts) >= 2 else ""
+        cell_patronymic = cell_parts[2] if len(cell_parts) >= 3 else ""
+
+        ex_surname = ex_parts[0] if len(ex_parts) >= 1 else ""
+        ex_name = ex_parts[1] if len(ex_parts) >= 2 else ""
+        ex_patronymic = ex_parts[2] if len(ex_parts) >= 3 else ""
+
+        surname_match = cell_surname == ex_surname
+        name_match = cell_name == ex_name
+        patronymic_match = cell_patronymic == ex_patronymic
+        matches_count = sum([surname_match, name_match, patronymic_match])
+
+        fio_differences: list[str] = []
+        if not surname_match:
+            fio_differences.append("Иная фамилия")
+        if not name_match:
+            fio_differences.append("Иное имя")
+        if not patronymic_match and cell_patronymic and ex_patronymic:
+            pass
+
+        if matches_count >= 2:
+            if fio_differences:
+                messages.append("; ".join(fio_differences))
+        elif matches_count == 1:
+            messages.append("Не найден")
+            if fio_differences:
+                messages.append("; ".join(fio_differences))
+        else:
+            messages.append("Не найден")
+
+    cell_cnp_norm = _norm_code(str(cell_cnp) if cell_cnp is not None else "")
+    ex_specialty_norm = _norm_code(ex_specialty)
+    if cell_cnp_norm not in ("", ERROR_TOKEN) and ex_specialty_norm not in ("", ERROR_TOKEN):
+        if cell_cnp_norm != ex_specialty_norm:
+            messages.append("Иное НПС")
+
+    if "Иное НПС" in messages:
+        messages.append(f"={ex_specialty}")
+
+    return "; ".join(messages)
+
+
+def transfer_extracted_data_and_logic_to_excel(
+    edu_loan_agr_num: str,
+    exctracted_fields: ExtractedFields,
+    lm: dspy.LM | None = None,
+) -> bool:
     if not OUTPUT_PATH.exists():
         if transfer_excel_data() != 0:
             print(f"File not found: {OUTPUT_PATH}")
             return False
 
-    from datetime import date, datetime
+    normalized_contract_number = normalize_credit_contract_number(edu_loan_agr_num)
+    if not normalized_contract_number:
+        return False
 
-    def _norm(value: object) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, (datetime, date)):
-            return value.strftime("%Y-%m-%d")
-        return str(value).strip()
-
-    def _safe_value(value: object) -> str:
-        if value is None:
-            return "ОШИБКА"
-        if isinstance(value, (datetime, date)):
-            return value.strftime("%Y-%m-%d")
-        text = str(value).strip()
-        return text if text else "ОШИБКА"
-
-    target_date = _norm(edu_loan_agr_date)
-    target_num = _norm(edu_loan_agr_num)
-
+    wb_out = _load_output_workbook()
     try:
-        wb_out = load_workbook(OUTPUT_PATH)
-    except TypeError as exc:
-        if "extLst" in str(exc):
-            if transfer_excel_data() != 0:
-                print(f"Failed to rebuild output: {OUTPUT_PATH}")
-                return False
-            wb_out = load_workbook(OUTPUT_PATH)
-        else:
-            raise
-    ws_out = wb_out.active
-
-    alignment = Alignment(horizontal="center", vertical="center")
-    font = Font(name="Times New Roman", size=12)
-
-    found = False
-    for row in ws_out.iter_rows(min_row=DATA_START_ROW):
-        cell_num = row[3]  # 4-й столбец
-        cell_date = row[4]  # 5-й столбец
-
-        if _norm(cell_num.value) == target_num and _norm(cell_date.value) == target_date:
-            cell_reporting = ws_out.cell(row=cell_num.row, column=9, value=reporting_dates)
-            cell_reporting.alignment = alignment
-            cell_reporting.font = font
-            found = True
-            break
-
-    wb_out.save(OUTPUT_PATH)
-    wb_out.close()
-    return found
-
-
-def transfer_extracted_data_and_logic_to_excel(edu_loan_agr_num: str, edu_loan_agr_date: str, exctracted_fields: ExtractedFields, lm: dspy.LM | None = None) -> bool:
-    """Заполняем графы 23-28 данными которые мы достали с помощью LLM и вывод в 29 граф"""
-    if not OUTPUT_PATH.exists():
-        if transfer_excel_data() != 0:
-            print(f"File not found: {OUTPUT_PATH}")
+        ws_out = _get_output_worksheet(wb_out)
+        matching_rows = find_matching_rows(ws_out, normalized_contract_number)
+        if not matching_rows:
             return False
 
-    from datetime import date, datetime
+        body_style_source = ws_out.cell(row=DATA_START_ROW, column=AI_OUTPUT_START_COLUMN)
 
-    def _norm(value: object) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, (datetime, date)):
-            return value.strftime("%Y-%m-%d")
-        return str(value).strip()
-    
-    def _safe_value(value: object) -> str:
-        if value is None:
-            return "ОШИБКА"
-        if isinstance(value, (datetime, date)):
-            return value.strftime("%Y-%m-%d")
-        text = str(value).strip()
-        return text if text else "ОШИБКА"
-    
-    def _check_university_match(cell_name: str, ex_name: str) -> tuple[bool, str]:
-        """
-        Проверка совпадения названий ВУЗов.
-        Сначала простая проверка, если сомнения — LLM.
-        :return: (совпадает: bool, комментарий: str)
-        """
-        if not cell_name or not ex_name:
-            return False, "Пустое название"
-        
-        if cell_name.upper() == "ОШИБКА" or ex_name.upper() == "ОШИБКА":
-            return False, "ОШИБКА в названии"
-        
-        cell_norm = _norm_text(cell_name)
-        ex_norm = _norm_text(ex_name)
+        ex_university = _safe_value(exctracted_fields.university_name)
+        ex_student_fio = _safe_value(exctracted_fields.student_fio)
+        ex_customer_fio = _safe_value(exctracted_fields.customer_fio)
+        ex_paid_number = _safe_value(exctracted_fields.paid_edu_contract_number)
+        ex_paid_date = _safe_value(exctracted_fields.paid_edu_contract_date)
+        ex_specialty = _safe_value(exctracted_fields.specialty_code)
 
-        def _normalize_university_for_compare(value: str) -> str:
-            normalized = _norm_text(value)
-            # Убираем кавычки и пунктуацию, чтобы OCR/форматирование
-            # не ломали сравнение одинаковых названий.
-            normalized = re.sub(r"[^0-9A-ZА-Я]+", " ", normalized)
-            normalized = re.sub(r"\s+", " ", normalized).strip()
-            return normalized
+        extracted_values = [
+            ex_university,
+            ex_student_fio,
+            ex_customer_fio,
+            ex_paid_number,
+            ex_paid_date,
+            ex_specialty,
+        ]
 
-        def _quoted_core(value: str) -> str:
-            match = re.search(r"[«\"]([^»\"]+)[»\"]", str(value))
-            if not match:
-                return ""
-            return _norm_text(match.group(1))
-        
-        # Уровень 1: Точное совпадение
-        if cell_norm == ex_norm:
-            return True, "Точное совпадение"
-        
-        # Уровень 2: Одно название в другом
-        if cell_norm in ex_norm or ex_norm in cell_norm:
-            return True, "Одно в другом"
+        for row_index in matching_rows:
+            for offset, value in enumerate(extracted_values):
+                cell = ws_out.cell(row=row_index, column=AI_OUTPUT_START_COLUMN + offset, value=value)
+                _copy_cell_style(body_style_source, cell)
 
-        # Уровень 2.2: Вхождение после мягкой нормализации (без кавычек/пунктуации)
-        cell_soft_norm = _normalize_university_for_compare(cell_name)
-        ex_soft_norm = _normalize_university_for_compare(ex_name)
-        if cell_soft_norm == ex_soft_norm:
-            return True, "Совпадение после нормализации"
-        if cell_soft_norm in ex_soft_norm or ex_soft_norm in cell_soft_norm:
-            return True, "Одно в другом после нормализации"
+            ai_result = _build_ai_result(ws_out, row_index, ex_university, ex_student_fio, ex_specialty, lm)
+            result_cell = ws_out.cell(row=row_index, column=AI_RESULT_COLUMN, value=ai_result)
+            _copy_cell_style(body_style_source, result_cell)
 
-        # Уровень 2.5: Совпадение ключевого имени в кавычках
-        cell_quoted_core = _quoted_core(cell_name)
-        ex_quoted_core = _quoted_core(ex_name)
-        if cell_quoted_core and ex_quoted_core and cell_quoted_core == ex_quoted_core:
-            return True, "Совпадение по названию в кавычках"
-        
-        # Уровень 3: Сомнения — спрашиваем LLM
-        try:
-            llm_result = check_university_name_llm(cell_name, ex_name, lm)
-            LOGGER.info(f"Уточняем у LLM сходсвто название вузов.")
-            if llm_result:
-                return True, "Совпадение по LLM"
-            else:
-                return False, "Разные ВУЗы (LLM)"
-        except Exception as e:
-            LOGGER.warning(f"Ошибка LLM при сравнении ВУЗов: {e}")
-            return False, "Ошибка LLM"
+        wb_out.save(OUTPUT_PATH)
+        return True
+    finally:
+        wb_out.close()
 
-    target_date = _norm(edu_loan_agr_date)
-    target_num = _norm(edu_loan_agr_num)
-
-    try:
-        wb_out = load_workbook(OUTPUT_PATH)
-    except TypeError as exc:
-        if "extLst" in str(exc):
-            if transfer_excel_data() != 0:
-                print(f"Failed to rebuild output: {OUTPUT_PATH}")
-                return False
-            wb_out = load_workbook(OUTPUT_PATH)
-        else:
-            raise
-    ws_out = wb_out.active
-
-    alignment = Alignment(horizontal="center", vertical="center")
-    font = Font(name="Times New Roman", size=12)
-
-    found = False
-    for row in ws_out.iter_rows(min_row=DATA_START_ROW):
-        cell_num = row[3]  # 4-й столбец
-        cell_date = row[4]  # 5-й столбец
-
-        if _norm(cell_num.value) == target_num and _norm(cell_date.value) == target_date:
-            ex_university = _safe_value(exctracted_fields.university_name)
-            ex_student_fio = _safe_value(exctracted_fields.student_fio)
-            ex_customer_fio = _safe_value(exctracted_fields.customer_fio)
-            ex_paid_number = _safe_value(exctracted_fields.paid_edu_contract_number)
-            ex_paid_date = _safe_value(exctracted_fields.paid_edu_contract_date)
-            ex_specialty = _safe_value(exctracted_fields.specialty_code)
-
-            extracted_values = [
-                ex_university,
-                ex_student_fio,
-                ex_customer_fio,
-                ex_paid_number,
-                ex_paid_date,
-                ex_specialty,
-            ]
-
-            for offset, value in enumerate(extracted_values, start=23):
-                cell_reporting = ws_out.cell(row=cell_num.row, column=offset, value=value)
-                cell_reporting.alignment = alignment
-                cell_reporting.font = font
-
-
-            # Тут мы формируем вывод ИИ по предоставленной логике
-            cell_university_name = row[1].value
-            cell_fio = row[2].value
-            cell_cnp = row[5].value  # Код направления подготовки
-
-            messages: list[str] = []
-
-            # Проверка ВУЗа (с LLM при сомнениях)
-            cell_university_norm = _norm_text(str(cell_university_name) if cell_university_name is not None else "")
-            ex_university_norm = _norm_text(ex_university)
-            if cell_university_norm not in ("", "ОШИБКА") and ex_university_norm not in ("", "ОШИБКА"):
-                is_match, comment = _check_university_match(cell_university_name, ex_university)
-                if not is_match:
-                    messages.append(f"Иной вуз")
-
-            # Проверка ФИО
-            cell_fio_norm = _norm_text(str(cell_fio) if cell_fio is not None else "")
-            ex_fio_norm = _norm_text(ex_student_fio)
-
-            if cell_fio_norm not in ("", "ОШИБКА") and ex_fio_norm not in ("", "ОШИБКА"):
-                cell_parts = cell_fio_norm.split()
-                ex_parts = ex_fio_norm.split()
-                
-                # Определяем части ФИО (фамилия, имя, отчество)
-                cell_surname = cell_parts[0] if len(cell_parts) >= 1 else ""
-                cell_name = cell_parts[1] if len(cell_parts) >= 2 else ""
-                cell_patronymic = cell_parts[2] if len(cell_parts) >= 3 else ""
-                
-                ex_surname = ex_parts[0] if len(ex_parts) >= 1 else ""
-                ex_name = ex_parts[1] if len(ex_parts) >= 2 else ""
-                ex_patronymic = ex_parts[2] if len(ex_parts) >= 3 else ""
-                
-                # Проверяем совпадения по частям
-                surname_match = cell_surname == ex_surname
-                name_match = cell_name == ex_name
-                patronymic_match = cell_patronymic == ex_patronymic
-                
-                # Считаем количество совпадений
-                matches_count = sum([surname_match, name_match, patronymic_match])
-                
-                # Формируем сообщения о несовпадениях
-                fio_differences: list[str] = []
-                if not surname_match:
-                    fio_differences.append("Иная фамилия")
-                if not name_match:
-                    fio_differences.append("Иное имя")
-                if not patronymic_match and cell_patronymic and ex_patronymic:
-                    # fio_differences.append("Иное отчество")
-                    pass
-                
-                # Логика вывода (по требованиям)
-                if matches_count >= 2:
-                    # Совпали минимум 2 части (фамилия+имя ИЛИ фамилия+отчество)
-                    # → Не выводим "Не найден", только указываем различия
-                    if fio_differences:
-                        messages.append("; ".join(fio_differences))
-                elif matches_count == 1:
-                    # Совпала только 1 часть (например, только фамилия)
-                    # → Выводим "Не найден" + уточнение
-                    messages.append("Не найден")
-                    if fio_differences:
-                        messages.append("; ".join(fio_differences))
-                else:
-                    # Не совпало ничего
-                    # → Выводим "Не найден"
-                    messages.append("Не найден")
-
-            cell_cnp_norm = _norm_code(str(cell_cnp) if cell_cnp is not None else "")
-            ex_specialty_norm = _norm_code(ex_specialty)
-            if cell_cnp_norm not in ("", "ОШИБКА") and ex_specialty_norm not in ("", "ОШИБКА"):
-                if cell_cnp_norm != ex_specialty_norm:
-                    messages.append("Иное НПС")
-
-            if "Иное НПС" in messages:
-                messages.append(f"={ex_specialty}")
-
-            result = "; ".join(messages)
-            cell_reporting = ws_out.cell(row=cell_num.row, column=29, value=result)
-
-            
-            cell_reporting.alignment = alignment
-            cell_reporting.font = font
-            found = True
-            break
-
-    wb_out.save(OUTPUT_PATH)
-    wb_out.close()
-    return found
 
 if __name__ == "__main__":
-    # raise SystemExit(transfer_excel_data())
-    transfer_reporting_data_to_excel("130291", "01.02.2025", "АВГУСТ;СЕНТЯБРЬ")
+    raise SystemExit(transfer_excel_data())

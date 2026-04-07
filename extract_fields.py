@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from normalizes import _normalize_value, _normalize_date, _normalize_specialty, _normalize_evidence
 
 from ocr_client import (
+    build_local_text_lm,
     OcrClientResponse,
     extract_text_from_image,
     extract_text_from_image_with_qwen3_vl,
@@ -239,7 +240,7 @@ if __name__ == "__main__":
     import argparse
 
     # 1) Настраиваем LLM для DSPy (один раз)
-    lm = dspy.LM("openrouter/qwen/qwen3-30b-a3b", api_key=os.environ["OPEN_ROUTER_API_KEY"])
+    lm = build_local_text_lm()
     dspy.configure(lm=lm)
 
     # 2) CLI аргументы
